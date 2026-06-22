@@ -1,2 +1,2 @@
 # deep-ml
-Practice Leetcode but for AI/ML
+Practice Leetcode but for AI/ML https://www.deep-ml.com/
