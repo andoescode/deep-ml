@@ -1,0 +1,8 @@
+numpy
+tensorflow
+h5py
+matplotlib
+scipy
+polars
+pandas
+kagglehub
