@@ -6,3 +6,5 @@ scipy
 polars
 pandas
 kagglehub
+torch
+torchvision
