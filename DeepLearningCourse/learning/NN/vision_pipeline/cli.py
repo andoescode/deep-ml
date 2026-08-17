@@ -4,6 +4,8 @@ notebook kernel and DataLoader workers shut down cleanly on exit.
     python -m vision_pipeline.cli train --dataset cifar10
     python -m vision_pipeline.cli train --dataset imagenet --epochs 100
     python -m vision_pipeline.cli train --dataset cifar10 --arch cnn --lr 3e-4
+    python -m vision_pipeline.cli train --preset imagenet_vit
+    python -m vision_pipeline.cli train --preset imagenet_vit --arch vit_base --patch-size 32
     python -m vision_pipeline.cli train --dataset imagenet --resume checkpoints/<run>_best.pt
     python -m vision_pipeline.cli eval  --dataset cifar10 --checkpoint checkpoints/<run>_best.pt
     python -m vision_pipeline.cli predict --dataset cifar10 --checkpoint <ckpt> img.png
@@ -17,27 +19,38 @@ import argparse
 from dataclasses import replace
 
 from .config import PRESETS, Config
+from .data import REGISTRY as DATASETS
 
 # CLI flag -> which sub-config it belongs to.
 DATA_FIELDS = ("root", "batch_size", "image_size", "num_workers", "random_erasing_p")
-# image_size lands in both: it selects the crop size AND sizes the CNN's FC head.
-MODEL_FIELDS = ("arch", "num_classes", "stem", "image_size")
+# image_size lands in both: it selects the crop size AND sizes the CNN's FC head
+# / the ViT's patch grid + position table.
+MODEL_FIELDS = (
+    "arch", "num_classes", "stem", "image_size",
+    "patch_size", "embed_dim", "depth", "num_heads", "mlp_dim", "drop_rate",
+)
 TRAIN_FIELDS = (
     "epochs", "optimizer", "lr", "weight_decay", "label_smoothing",
-    "warmup_epochs", "run_name",
+    "warmup_epochs", "grad_clip", "run_name",
 )
 
 
 def build_config(args) -> Config:
-    """Start from the dataset preset, then apply only the flags that were given."""
-    cfg = Config.preset(args.dataset)
+    """Start from the named preset, then apply only the flags that were given.
+
+    `--preset` defaults to `--dataset`, so `--dataset imagenet` still means the
+    imagenet preset; presets that are not dataset names (`imagenet_vit`) carry
+    their own `data.dataset`, which `--dataset` can still override.
+    """
+    preset = args.preset or args.dataset or "cifar10"
+    cfg = Config.preset(preset)
 
     def given(fields):
         return {f: getattr(args, f) for f in fields if getattr(args, f, None) is not None}
 
     cfg = replace(
         cfg,
-        data=replace(cfg.data, dataset=args.dataset, **given(DATA_FIELDS)),
+        data=replace(cfg.data, dataset=args.dataset or cfg.data.dataset, **given(DATA_FIELDS)),
         model=replace(cfg.model, **given(MODEL_FIELDS)),
         train=replace(cfg.train, **given(TRAIN_FIELDS)),
     )
@@ -54,7 +67,13 @@ def build_config(args) -> Config:
 
 def add_common(parser):
     """Flags shared by every subcommand. Defaults are None = 'use the preset'."""
-    parser.add_argument("--dataset", default="cifar10", choices=sorted(PRESETS))
+    parser.add_argument("--dataset", default=None, choices=sorted(DATASETS))
+    parser.add_argument(
+        "--preset",
+        default=None,
+        choices=sorted(PRESETS),
+        help="config preset to start from (default: same name as --dataset)",
+    )
     parser.add_argument("--root", default=None, help="dataset root directory")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--image-size", type=int, default=None)
@@ -63,6 +82,13 @@ def add_common(parser):
     parser.add_argument("--arch", default=None)
     parser.add_argument("--num-classes", type=int, default=None)
     parser.add_argument("--stem", default=None, choices=["cifar", "imagenet"])
+    # ViT knobs — unset means "use the arch preset's value".
+    parser.add_argument("--patch-size", type=int, default=None)
+    parser.add_argument("--embed-dim", type=int, default=None)
+    parser.add_argument("--depth", type=int, default=None)
+    parser.add_argument("--num-heads", type=int, default=None)
+    parser.add_argument("--mlp-dim", type=int, default=None)
+    parser.add_argument("--drop-rate", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
     # Present but unset on non-train subcommands so build_config can read them.
     parser.set_defaults(**{f: None for f in TRAIN_FIELDS})
@@ -80,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     p_train.add_argument("--weight-decay", type=float, default=None)
     p_train.add_argument("--label-smoothing", type=float, default=None)
     p_train.add_argument("--warmup-epochs", type=int, default=None)
+    p_train.add_argument("--grad-clip", type=float, default=None)
     p_train.add_argument("--run-name", default=None)
     p_train.add_argument("--resume", default=None, help="checkpoint to continue from")
     p_train.add_argument(

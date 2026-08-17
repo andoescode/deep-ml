@@ -103,6 +103,18 @@ class ModelConfig:
     hidden_dim: int = 128
     batch_norm: bool = False
 
+    # ViT-only knobs. None = "use the arch preset's value" (see models/vit.py
+    # _VARIANTS); `image_size` must match DataConfig.image_size, since pos_embed
+    # has one row per patch and cannot be resized after init.
+    patch_size: int | None = None
+    embed_dim: int | None = None
+    depth: int | None = None
+    num_heads: int | None = None
+    mlp_dim: int | None = None  # None -> embed_dim * mlp_ratio
+    mlp_ratio: float = 4.0
+    drop_rate: float = 0.1
+    attention: str = "torch"  # "torch" (fused) | "custom" (inspectable)
+
     channels_last: bool = True
     compile: bool = False
 
@@ -207,7 +219,51 @@ def _imagenet_preset() -> Config:
     )
 
 
+def _imagenet_vit_preset() -> Config:
+    """ViT-Small/16 on 224x224 — the from-scratch ViT recipe (Dosovitskiy et al.).
+
+    Differs from the ResNet recipe in the ways ViTs need: lower lr, much higher
+    weight decay (0.1), a longer warmup, and gradient clipping at 1.0 — an
+    unclipped from-scratch ViT diverges in the first few hundred steps often
+    enough to be worth the default.
+
+    ViTs have no convolutional prior, so the augmentation column matters more
+    here than it does for a ResNet; RandomErasing is on by default for that
+    reason (Mixup/CutMix would be the next lever, and are not implemented yet).
+    """
+    return Config(
+        data=DataConfig(
+            dataset="imagenet",
+            root="./dataset/Imagenet_1k_extract",
+            image_size=224,
+            resize_size=256,
+            batch_size=128,
+            eval_batch_size=128,
+            random_erasing_p=0.25,
+            eval_samples_per_class=10,
+        ),
+        model=ModelConfig(
+            arch="vit_small",
+            num_classes=1000,
+            image_size=224,  # must equal data.image_size — pos_embed is sized here
+            patch_size=16,  # -> 196 patches + 1 CLS token
+            drop_rate=0.1,
+        ),
+        train=TrainConfig(
+            epochs=100,
+            optimizer="adamw",
+            lr=3e-4,
+            weight_decay=0.1,
+            label_smoothing=0.1,
+            scheduler="warmup_cosine",
+            warmup_epochs=10,
+            grad_clip=1.0,
+        ),
+    )
+
+
 PRESETS = {
     "cifar10": _cifar10_preset,
     "imagenet": _imagenet_preset,
+    "imagenet_vit": _imagenet_vit_preset,
 }

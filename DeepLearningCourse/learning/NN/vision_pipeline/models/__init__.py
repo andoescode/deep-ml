@@ -16,6 +16,13 @@ from .resnet import (
     ResNet,
     build_resnet,
 )
+from .vit import (
+    MultiHeadSelfAttention,
+    PatchEmbedding,
+    TransformerEncoderLayer,
+    ViT,
+    build_vit,
+)
 
 # arch name -> builder; builders accept the full kwarg set and ignore the rest.
 REGISTRY = {
@@ -26,6 +33,11 @@ REGISTRY = {
     "resnet152": build_resnet,
     "resnet_custom": build_resnet,
     "cnn": build_cnn,
+    "vit_simple": build_vit,
+    "vit_tiny": build_vit,
+    "vit_small": build_vit,
+    "vit_base": build_vit,
+    "vit_custom": build_vit,
 }
 
 
@@ -52,6 +64,14 @@ def build_model(cfg: ModelConfig | None = None, device: torch.device | None = No
         dropout=cfg.dropout,
         hidden_dim=cfg.hidden_dim,
         batch_norm=cfg.batch_norm,
+        patch_size=cfg.patch_size,
+        embed_dim=cfg.embed_dim,
+        depth=cfg.depth,
+        num_heads=cfg.num_heads,
+        mlp_dim=cfg.mlp_dim,
+        mlp_ratio=cfg.mlp_ratio,
+        drop_rate=cfg.drop_rate,
+        attention=cfg.attention,
     )
 
     if device is not None:
@@ -75,9 +95,14 @@ __all__ = [
     "BasicResidualBlock",
     "BottleneckResidualBlock",
     "CNN",
+    "MultiHeadSelfAttention",
+    "PatchEmbedding",
     "ResNet",
+    "TransformerEncoderLayer",
+    "ViT",
     "build_cnn",
     "build_model",
     "build_resnet",
+    "build_vit",
     "count_parameters",
 ]

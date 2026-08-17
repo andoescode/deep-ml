@@ -24,13 +24,21 @@ from .data import Loaders
 def split_decay_params(model: nn.Module) -> tuple[list, list]:
     """Split params into (weight-decayed, not-decayed).
 
-    Weight decay goes on conv/linear weights ONLY: decaying BN affine params and
-    biases (everything with ndim == 1) fights the normalization instead of
-    regularizing.
+    Weight decay goes on conv/linear weights ONLY: decaying BN/LayerNorm affine
+    params and biases (everything with ndim == 1) fights the normalization
+    instead of regularizing.
+
+    A model can exempt extra params by name via a `no_weight_decay()` method —
+    the ViT uses it for `cls_token` and `pos_embed`, which are ndim 3 and so
+    would otherwise land in the decayed group.
     """
+    exempt = model.no_weight_decay() if hasattr(model, "no_weight_decay") else set()
+
     decay, no_decay = [], []
-    for _, p in model.named_parameters():
-        (no_decay if p.ndim == 1 else decay).append(p)
+    for name, p in model.named_parameters():
+        # torch.compile wraps the module, prefixing every param name.
+        name = name.removeprefix("_orig_mod.")
+        (no_decay if p.ndim == 1 or name in exempt else decay).append(p)
     return decay, no_decay
 
 
