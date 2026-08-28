@@ -3,6 +3,12 @@
 Add a new dataset as its own module exposing `build_datasets(cfg)`,
 `build_train_transform(cfg)`, `build_eval_transform(cfg)`, `MEAN` and `STD`,
 then register it here.
+
+Optional module attributes:
+    TASK                     — "classification" (assumed) or "segmentation"
+    build_image_transform    — image-only eval transform, for inference on files
+                               when the dataset's own transform is a paired one
+    num_classes(cfg)         — when the head width depends on a data setting
 """
 from __future__ import annotations
 
@@ -12,11 +18,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..config import DataConfig
-from . import cifar10, imagenet
+from . import cifar10, imagenet, oxford_pet
 
 REGISTRY = {
     "cifar10": cifar10,
     "imagenet": imagenet,
+    "oxford_pet": oxford_pet,
 }
 
 
@@ -32,12 +39,46 @@ def normalization(cfg: DataConfig) -> tuple[tuple[float, ...], tuple[float, ...]
     return module.MEAN, module.STD
 
 
+def task(cfg: DataConfig) -> str:
+    """"classification" or "segmentation" — what the loop should optimize/score.
+
+    Datasets that predate the distinction do not declare TASK, so the default
+    keeps them classification.
+    """
+    return getattr(get_dataset_module(cfg.dataset), "TASK", "classification")
+
+
+def num_classes(cfg: DataConfig) -> int | None:
+    """Head width the dataset requires, when it depends on a data setting.
+
+    Oxford-Pet needs this: `boundary="class"` turns a 1-logit binary head into a
+    3-class one. None means "the dataset does not care", i.e. trust ModelConfig.
+    """
+    module = get_dataset_module(cfg.dataset)
+    resolver = getattr(module, "num_classes", None)
+    if callable(resolver):
+        return resolver(cfg)
+    return getattr(module, "NUM_CLASSES", None)
+
+
 def build_train_transform(cfg: DataConfig):
     return get_dataset_module(cfg.dataset).build_train_transform(cfg)
 
 
 def build_eval_transform(cfg: DataConfig):
     return get_dataset_module(cfg.dataset).build_eval_transform(cfg)
+
+
+def build_image_transform(cfg: DataConfig):
+    """Image-only eval transform for inference on bare files.
+
+    Segmentation datasets use *paired* (image, mask) transforms that cannot be
+    called with an image alone, so they publish a separate image-only version;
+    for classification datasets the eval transform already is one.
+    """
+    module = get_dataset_module(cfg.dataset)
+    builder = getattr(module, "build_image_transform", None)
+    return builder(cfg) if builder else module.build_eval_transform(cfg)
 
 
 def build_datasets(cfg: DataConfig):
@@ -122,8 +163,11 @@ __all__ = [
     "Loaders",
     "build_datasets",
     "build_eval_transform",
+    "build_image_transform",
     "build_loaders",
     "build_train_transform",
     "get_dataset_module",
     "normalization",
+    "num_classes",
+    "task",
 ]

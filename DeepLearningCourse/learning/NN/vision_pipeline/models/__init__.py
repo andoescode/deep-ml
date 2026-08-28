@@ -16,6 +16,7 @@ from .resnet import (
     ResNet,
     build_resnet,
 )
+from .unet import Decoder, Encoder, Unet, build_unet
 from .vit import (
     MultiHeadSelfAttention,
     PatchEmbedding,
@@ -38,6 +39,10 @@ REGISTRY = {
     "vit_small": build_vit,
     "vit_base": build_vit,
     "vit_custom": build_vit,
+    "unet": build_unet,
+    "unet_small": build_unet,
+    "unet_tiny": build_unet,
+    "unet_custom": build_unet,
 }
 
 
@@ -72,6 +77,8 @@ def build_model(cfg: ModelConfig | None = None, device: torch.device | None = No
         mlp_ratio=cfg.mlp_ratio,
         drop_rate=cfg.drop_rate,
         attention=cfg.attention,
+        base_channels=cfg.base_channels,
+        up_mode=cfg.up_mode,
     )
 
     if device is not None:
@@ -99,10 +106,12 @@ __all__ = [
     "PatchEmbedding",
     "ResNet",
     "TransformerEncoderLayer",
+    "Unet",
     "ViT",
     "build_cnn",
     "build_model",
     "build_resnet",
+    "build_unet",
     "build_vit",
     "count_parameters",
 ]

@@ -3,6 +3,17 @@
 `train()` is the one entry point the notebook and the CLI both call. It returns
 the per-epoch history so the notebook can plot/compare parameter tweaks without
 re-reading TensorBoard.
+
+The loop is task-agnostic. It asks the dataset module whether this is
+classification or segmentation (`data.task`) and then routes three things:
+
+    criterion — CrossEntropyLoss vs BCE+Dice (see segmentation.py)
+    targets   — class indices vs (B, 1, H, W) label maps
+    scoring   — top-1 accuracy vs Dice
+
+Everything else — warmup/cosine, AMP, channels_last, checkpoint-on-best,
+TensorBoard, resume — is shared, and `History.test_acc` holds whichever primary
+score the task uses (`History.metric_name` says which).
 """
 from __future__ import annotations
 
@@ -16,8 +27,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+from . import segmentation
 from .config import Config, TrainConfig, get_device, set_seed
 from .data import Loaders
+
+CLASSIFICATION = "classification"
+SEGMENTATION = "segmentation"
 
 
 # Optimizer / scheduler / criterion
@@ -95,10 +110,42 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: TrainConfig):
     raise ValueError(f"Unknown scheduler {cfg.scheduler!r}.")
 
 
-def build_criterion(cfg: TrainConfig) -> nn.Module:
-    # Label smoothing caps logit over-confidence; the printed loss floors near
-    # ~0.5 instead of 0 — that is expected, not a bug.
-    return nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+def build_criterion(
+    cfg: TrainConfig,
+    task: str = CLASSIFICATION,
+    num_classes: int = 10,
+) -> nn.Module:
+    """Loss for `task`, or for `cfg.criterion` when that is not "auto"."""
+    name = cfg.criterion.lower()
+
+    if name == "auto":
+        name = "bce_dice" if task == SEGMENTATION else "cross_entropy"
+
+    if name == "cross_entropy":
+        if task == SEGMENTATION:
+            # Dense CE: ignore_index skips the void band, and the loop squeezes
+            # the channel dim off the mask before calling it.
+            return segmentation.build_criterion(
+                num_classes=max(2, num_classes),
+                label_smoothing=cfg.label_smoothing,
+            )
+        # Label smoothing caps logit over-confidence; the printed loss floors near
+        # ~0.5 instead of 0 — that is expected, not a bug.
+        return nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+
+    if name in ("bce", "bce_dice"):
+        if task != SEGMENTATION:
+            raise ValueError(f"criterion {name!r} is segmentation-only")
+        # "bce" is the v1.0 recipe: no region term at all.
+        return segmentation.build_criterion(
+            num_classes=num_classes,
+            dice_weight=cfg.dice_weight if name == "bce_dice" else 0.0,
+        )
+
+    raise ValueError(
+        f"Unknown criterion {cfg.criterion!r}. Use 'auto', 'cross_entropy', "
+        "'bce' or 'bce_dice'."
+    )
 
 
 # Evaluation
@@ -137,6 +184,24 @@ def check_accuracy(
 
 def top1(loader: DataLoader, model: nn.Module, **kw) -> float:
     return check_accuracy(loader, model, topk=(1,), **kw)[1]
+
+
+# The score the loop selects checkpoints on, per task.
+PRIMARY_METRIC = {CLASSIFICATION: "acc", SEGMENTATION: "dice"}
+
+
+def evaluate(
+    loader: DataLoader,
+    model: nn.Module,
+    task: str = CLASSIFICATION,
+    device: torch.device | None = None,
+    amp: bool = True,
+) -> dict[str, float]:
+    """Metrics for `task`. Always contains PRIMARY_METRIC[task]."""
+    if task == SEGMENTATION:
+        return segmentation.evaluate(loader, model, device=device, amp=amp)
+
+    return {"acc": top1(loader, model, device=device, amp=amp)}
 
 
 @torch.inference_mode()
@@ -217,36 +282,63 @@ def load_checkpoint(
 # The loop
 @dataclass
 class History:
-    """Per-epoch metrics — the return value the notebook plots."""
+    """Per-epoch metrics — the return value the notebook plots.
+
+    `train_acc`/`test_acc` hold the task's PRIMARY score, which is Dice for
+    segmentation runs; `metric_name` says which. The names are kept as-is so
+    existing classification notebooks keep working, and `test_metrics` carries
+    the full per-epoch dict (pixel_acc, dice, iou, mean_iou) when there is one.
+    """
 
     run_name: str
     best_acc: float = 0.0
     best_epoch: int = -1
+    metric_name: str = "acc"
     epoch: list[int] = field(default_factory=list)
     loss: list[float] = field(default_factory=list)
     train_acc: list[float] = field(default_factory=list)
     test_acc: list[float] = field(default_factory=list)
     lr: list[float] = field(default_factory=list)
     epoch_time: list[float] = field(default_factory=list)
+    train_metrics: list[dict[str, float]] = field(default_factory=list)
+    test_metrics: list[dict[str, float]] = field(default_factory=list)
 
     @property
     def gap(self) -> list[float]:
-        """train - test accuracy per epoch; the overfitting readout."""
+        """train - test primary score per epoch; the overfitting readout."""
         return [tr - te for tr, te in zip(self.train_acc, self.test_acc)]
+
+    @property
+    def best_score(self) -> float:
+        """`best_acc` under a task-neutral name."""
+        return self.best_acc
+
+    def series(self, key: str, split: str = "test") -> list[float]:
+        """One named metric's curve, e.g. history.series("iou")."""
+        rows = self.test_metrics if split == "test" else self.train_metrics
+        return [row[key] for row in rows if key in row]
 
     def to_frame(self):
         """pandas DataFrame of the per-epoch curves (pandas imported lazily)."""
         import pandas as pd
 
-        return pd.DataFrame({
+        frame = pd.DataFrame({
             "epoch": self.epoch,
             "loss": self.loss,
-            "train_acc": self.train_acc,
-            "test_acc": self.test_acc,
+            f"train_{self.metric_name}": self.train_acc,
+            f"test_{self.metric_name}": self.test_acc,
             "gap": self.gap,
             "lr": self.lr,
             "epoch_time": self.epoch_time,
         })
+
+        # Secondary segmentation metrics, when the task produced any.
+        for key in ("pixel_acc", "iou", "mean_iou"):
+            values = self.series(key)
+            if len(values) == len(self.epoch):
+                frame[f"test_{key}"] = values
+
+        return frame
 
 
 def default_run_name(cfg: Config) -> str:
@@ -277,14 +369,24 @@ def train(
     Any of optimizer/scheduler/criterion/writer may be supplied to override the
     ones built from `cfg` — handy for notebook experiments.
     """
+    from .data import normalization, task as task_of
+
     cfg = cfg or Config()
     tcfg = cfg.train
     device = device or get_device()
 
+    task = task_of(cfg.data)
+    metric_name = PRIMARY_METRIC[task]
+    segmenting = task == SEGMENTATION
+    # Dense CE wants (B, H, W) targets; BCE wants the channel dim kept.
+    squeeze_target = segmenting and cfg.model.num_classes > 1
+
     optimizer = optimizer or build_optimizer(model, tcfg)
     if scheduler is None:
         scheduler = build_scheduler(optimizer, tcfg)
-    criterion = criterion or build_criterion(tcfg)
+    criterion = criterion or build_criterion(
+        tcfg, task=task, num_classes=cfg.model.num_classes
+    )
 
     run_name = default_run_name(cfg)
     owns_writer = writer is None
@@ -303,8 +405,11 @@ def train(
     ckpt_best = os.path.join(tcfg.checkpoint_dir, f"{run_name}_best.pt")
     ckpt_final = os.path.join(tcfg.checkpoint_dir, f"{run_name}_final.pt")
 
-    history = History(run_name=run_name, best_acc=best_acc)
+    history = History(run_name=run_name, best_acc=best_acc, metric_name=metric_name)
     step = start_epoch * len(loaders.train)
+
+    # Previews are un-normalized before display, so the mask rows are readable.
+    preview_stats = normalization(cfg.data) if segmenting and cfg.data.normalize else (None, None)
 
     try:
         for epoch in range(start_epoch, tcfg.epochs):
@@ -315,6 +420,8 @@ def train(
             for data, targets in loaders.train:
                 data = data.to(device, non_blocking=True, memory_format=torch.channels_last)
                 targets = targets.to(device, non_blocking=True)
+                if squeeze_target:
+                    targets = targets.squeeze(1)
 
                 # Forward propagation
                 with torch.amp.autocast("cuda", enabled=amp):
@@ -338,9 +445,11 @@ def train(
 
             avg_epoch_loss = running_loss / max(1, len(loaders.train))
 
-            # Train accuracy on the clean fixed subset, test on the full test set.
-            train_acc = top1(loaders.eval_train, model, device=device, amp=amp)
-            test_acc = top1(loaders.val, model, device=device, amp=amp)
+            # Train score on the clean fixed subset, test on the full test set.
+            train_metrics = evaluate(loaders.eval_train, model, task, device=device, amp=amp)
+            test_metrics = evaluate(loaders.val, model, task, device=device, amp=amp)
+            train_acc = train_metrics[metric_name]
+            test_acc = test_metrics[metric_name]
 
             if scheduler is not None:
                 scheduler.step()
@@ -350,11 +459,24 @@ def train(
             epoch_time = time.perf_counter() - t0
 
             writer.add_scalar("Loss/train_epoch", avg_epoch_loss, epoch)
-            writer.add_scalar("Accuracy/train", train_acc, epoch)
-            writer.add_scalar("Accuracy/test", test_acc, epoch)
-            writer.add_scalar("Accuracy/gap", train_acc - test_acc, epoch)
+            # One scalar group per metric so TensorBoard overlays train vs test.
+            for key, value in train_metrics.items():
+                writer.add_scalar(f"{key}/train", value, epoch)
+            for key, value in test_metrics.items():
+                writer.add_scalar(f"{key}/test", value, epoch)
+            writer.add_scalar(f"{metric_name}/gap", train_acc - test_acc, epoch)
             writer.add_scalar("LR", current_lr, epoch)
             writer.add_scalar("Time/epoch_sec", epoch_time, epoch)
+
+            if segmenting and (
+                epoch % max(1, tcfg.log_images_every) == 0 or epoch == tcfg.epochs - 1
+            ):
+                # Scalars do not show whether the masks look right.
+                segmentation.log_predictions(
+                    writer, model, loaders.val, epoch,
+                    device=device, amp=amp,
+                    mean=preview_stats[0], std=preview_stats[1],
+                )
 
             history.epoch.append(epoch)
             history.loss.append(avg_epoch_loss)
@@ -362,6 +484,8 @@ def train(
             history.test_acc.append(test_acc)
             history.lr.append(current_lr)
             history.epoch_time.append(epoch_time)
+            history.train_metrics.append(train_metrics)
+            history.test_metrics.append(test_metrics)
 
             # Keep the best weights — cosine-to-zero means the last epoch is
             # usually the best, but this is insurance against surprises.
@@ -370,15 +494,21 @@ def train(
                 history.best_epoch = epoch
                 save_checkpoint(
                     ckpt_best, model, optimizer, scheduler,
-                    epoch=epoch, test_acc=test_acc, config=cfg.to_dict(),
+                    epoch=epoch, test_acc=test_acc, test_metrics=test_metrics,
+                    metric_name=metric_name, config=cfg.to_dict(),
                 )
 
             if verbose:
+                label = metric_name.capitalize()
+                extra = (
+                    f"Test IoU: {test_metrics['iou']:.4f}, " if segmenting else ""
+                )
                 print(
                     f"Epoch [{epoch + 1}/{tcfg.epochs}], "
                     f"Loss: {avg_epoch_loss:.4f}, "
-                    f"Train Acc: {train_acc:.4f}, "
-                    f"Test Acc: {test_acc:.4f}, "
+                    f"Train {label}: {train_acc:.4f}, "
+                    f"Test {label}: {test_acc:.4f}, "
+                    f"{extra}"
                     f"LR: {current_lr:.6f}, "
                     f"{epoch_time:.1f}s",
                     flush=True,
@@ -389,7 +519,7 @@ def train(
             writer.close()
 
     if verbose:
-        print(f"Best test acc: {history.best_acc:.4f} ({ckpt_best})")
+        print(f"Best test {metric_name}: {history.best_acc:.4f} ({ckpt_best})")
 
     return history
 
@@ -400,11 +530,24 @@ def setup(cfg: Config | None = None, resume: str | None = None, fresh_schedule: 
 
     The notebook calls this to get handles it can inspect before training.
     """
-    from .data import build_loaders
+    from .data import build_loaders, num_classes as data_num_classes, task as task_of
     from .models import build_model, count_parameters
 
     cfg = cfg or Config()
     device = get_device()
+
+    task = task_of(cfg.data)
+
+    # Catch a head/target mismatch here rather than as a shape error 40 layers in:
+    # oxford_pet's boundary="class" mode needs a 3-channel head, every other mode
+    # needs 1. (Classification datasets have a fixed class count, so a mismatch
+    # there is a config typo just the same.)
+    required = data_num_classes(cfg.data)
+    if required is not None and required != cfg.model.num_classes:
+        raise ValueError(
+            f"dataset {cfg.data.dataset!r} needs model.num_classes={required}, "
+            f"got {cfg.model.num_classes}"
+        )
 
     set_seed(cfg.data.seed)
     loaders = build_loaders(cfg.data)
@@ -416,7 +559,7 @@ def setup(cfg: Config | None = None, resume: str | None = None, fresh_schedule: 
 
     optimizer = build_optimizer(model, cfg.train)
     scheduler = build_scheduler(optimizer, cfg.train)
-    criterion = build_criterion(cfg.train)
+    criterion = build_criterion(cfg.train, task=task, num_classes=cfg.model.num_classes)
 
     resume_state = {"start_epoch": 0, "best_acc": 0.0}
     if resume:

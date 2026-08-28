@@ -5,8 +5,9 @@ Everything tunable lives here as a dataclass so a notebook can build variants
 
 Start from a preset rather than the bare defaults:
 
-    cfg = Config.preset("cifar10")    # v2.0 recipe: resnet18 + SGD 0.1
-    cfg = Config.preset("imagenet")   # resnet34 + AdamW 1e-3
+    cfg = Config.preset("cifar10")     # v2.0 recipe: resnet18 + SGD 0.1
+    cfg = Config.preset("imagenet")    # resnet34 + AdamW 1e-3
+    cfg = Config.preset("oxford_pet")  # U-Net segmentation + BCE/Dice
 """
 from __future__ import annotations
 
@@ -62,10 +63,21 @@ class DataConfig:
     crop_padding: int = 4
     crop_padding_mode: str = "reflect"
 
-    # imagenet: RandomResizedCrop bounds + val Resize -> CenterCrop.
+    # imagenet, oxford_pet: RandomResizedCrop bounds + val Resize -> CenterCrop.
     crop_scale: tuple[float, float] = (0.08, 1.0)
     crop_ratio: tuple[float, float] = (3 / 4, 4 / 3)
     resize_size: int = 256
+
+    # oxford_pet: Resize((presize, presize)) -> RandomCrop(image_size) instead of
+    # RandomResizedCrop. Reproduces the v1.0 geometry; None uses RandomResizedCrop.
+    presize: int | None = None
+    normalize: bool = True
+    rotation_degrees: float = 0.0
+    color_jitter: float = 0.0  # brightness/contrast/saturation amount; hue gets half
+
+    # oxford_pet: what to do with trimap class 3, the annotators' "not classified"
+    # band (13% of all pixels). See data/oxford_pet.py — this changes the task.
+    boundary: str = "ignore"  # "ignore" | "foreground" | "background" | "class"
 
     # Clean fixed subset of the train split used for train-accuracy readings.
     # cifar10 takes the first N samples; imagenet takes N per class.
@@ -103,6 +115,13 @@ class ModelConfig:
     hidden_dim: int = 128
     batch_norm: bool = False
 
+    # U-Net-only knobs. `depth` below is shared with the ViT (it means "number of
+    # downsampling stages" here, "number of encoder blocks" there); base_channels
+    # None = "use the arch preset's value" (see models/unet.py _VARIANTS).
+    # `image_size` must be divisible by 2 ** depth or the skips misalign.
+    base_channels: int | None = None
+    up_mode: str = "transpose"  # "transpose" (paper up-conv) | "bilinear" (no checkerboard)
+
     # ViT-only knobs. None = "use the arch preset's value" (see models/vit.py
     # _VARIANTS); `image_size` must match DataConfig.image_size, since pos_embed
     # has one row per patch and cannot be resized after init.
@@ -128,7 +147,11 @@ class TrainConfig:
     momentum: float = 0.9  # sgd only
     nesterov: bool = True  # sgd only
 
+    # "auto" picks CrossEntropyLoss for classification and BCE+Dice for
+    # segmentation, from the dataset module's TASK.
+    criterion: str = "auto"  # "auto" | "cross_entropy" | "bce" | "bce_dice"
     label_smoothing: float = 0.1
+    dice_weight: float = 0.5  # segmentation only: BCE + dice_weight * soft Dice
 
     scheduler: str = "warmup_cosine"  # "warmup_cosine" | "cosine" | "none"
     warmup_epochs: int = 5
@@ -139,6 +162,7 @@ class TrainConfig:
     grad_clip: float | None = None
 
     log_every: int = 50
+    log_images_every: int = 5  # segmentation only: epochs between mask previews
     run_dir: str = "runs"  # per-dataset subdir is appended by train()
     checkpoint_dir: str = "checkpoints"
     run_name: str | None = None  # auto-timestamped when None
@@ -262,8 +286,112 @@ def _imagenet_vit_preset() -> Config:
     )
 
 
+def _oxford_pet_preset() -> Config:
+    """U-Net on Oxford-IIIT Pet — binary segmentation, the recommended recipe.
+
+    Differs from the notebook's v1.0 run (see _oxford_pet_v1_preset) in the four
+    ways the v1.0 post-mortem called for, in payoff order:
+
+      * boundary="ignore" — trimap class 3 is excluded from loss and metric
+        instead of counted as pet, matching how VOC/Cityscapes treat void borders.
+        (Note: this RAISES the reported Dice by ~0.5 points, not lowers it — the
+        void band is the hard region. The reason to switch is comparability, not
+        conservatism. See oxford_pet_analysis.ipynb S5a.)
+      * BCE + 0.5 x soft Dice, so the loss optimises the region overlap the metric
+        scores rather than per-pixel likelihood alone. (Weaker justification than
+        it first appeared: the analysis notebook S5f finds the boundary carries
+        only ~13% of the error mass, most of it being whole-object failure.)
+      * RandomResizedCrop + rotation + colour jitter, replacing v1.0's
+        Resize(144) -> RandomCrop(128), which zoomed train but not test.
+      * 60 epochs, not 100. v1.0's test Dice moved 0.2 points over its last 40
+        epochs; the compute is better spent on image_size.
+
+    up_mode="bilinear" avoids the checkerboard artifacts ConvTranspose2d leaves in
+    the mask. It costs ~11% more parameters (31.04M -> 34.52M), not fewer — the
+    3x3 conv that follows the upsample is bigger than the 2x2 transposed conv it
+    replaces.
+
+    image_size stays 128 for comparability with v1.0. Raising it to 224 (a
+    multiple of 2**4) is the next single-line experiment worth running.
+    """
+    return Config(
+        data=DataConfig(
+            dataset="oxford_pet",
+            root="dataset/",
+            image_size=128,
+            batch_size=32,
+            eval_batch_size=64,
+            boundary="ignore",
+            crop_scale=(0.7, 1.0),
+            crop_ratio=(3 / 4, 4 / 3),
+            rotation_degrees=10.0,
+            color_jitter=0.2,
+            eval_train_size=1_000,
+        ),
+        model=ModelConfig(
+            arch="unet",
+            num_classes=1,  # one logit per pixel; boundary="class" needs 3
+            image_size=128,
+            up_mode="bilinear",
+            drop_rate=0.0,  # NOT the lever here: v1.0's gap was 3 points
+        ),
+        train=TrainConfig(
+            epochs=60,
+            optimizer="adamw",
+            lr=1e-3,
+            weight_decay=1e-4,
+            criterion="bce_dice",
+            dice_weight=0.5,
+            scheduler="warmup_cosine",
+            warmup_epochs=5,
+        ),
+    )
+
+
+def _oxford_pet_v1_preset() -> Config:
+    """Exact reproduction of the notebook's v1.0 run.
+
+    Verified: best test Dice 0.9367 (epoch 86), IoU 0.8964, PixAcc 0.9538 on an
+    RTX 5080, ~6.1 s/epoch. Kept so that number stays reproducible after the
+    default recipe moves on — but read the caveats in the notebook before
+    comparing it to anything: boundary="foreground" and normalize=False are both
+    non-standard, and it is scored at 128px rather than native resolution.
+    """
+    return Config(
+        data=DataConfig(
+            dataset="oxford_pet",
+            root="dataset/",
+            image_size=128,
+            batch_size=32,
+            eval_batch_size=64,
+            boundary="foreground",  # trimap class 3 counted as pet
+            normalize=False,  # v1.0 fed [0, 1] straight in
+            presize=144,  # Resize(144) -> RandomCrop(128)
+            eval_train_size=1_000,
+        ),
+        model=ModelConfig(
+            arch="unet",
+            num_classes=1,
+            image_size=128,
+            up_mode="transpose",
+            drop_rate=0.0,
+        ),
+        train=TrainConfig(
+            epochs=100,
+            optimizer="adamw",
+            lr=1e-3,
+            weight_decay=1e-4,
+            criterion="bce",  # dice_weight ignored
+            scheduler="warmup_cosine",
+            warmup_epochs=5,
+        ),
+    )
+
+
 PRESETS = {
     "cifar10": _cifar10_preset,
     "imagenet": _imagenet_preset,
     "imagenet_vit": _imagenet_vit_preset,
+    "oxford_pet": _oxford_pet_preset,
+    "oxford_pet_v1": _oxford_pet_v1_preset,
 }
