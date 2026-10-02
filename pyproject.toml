@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "h5py>=3.16.0",
+    "import-ipynb>=0.2.1",
     "kagglehub>=1.0.2",
     "matplotlib>=3.11.0",
     "numpy>=2.4.6",
