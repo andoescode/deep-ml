@@ -1,4 +1,2 @@
-DeepLearningCourse/learning/NN/checkpoints/
-.claude
-DeepLearningCourse/learning/NN/dataset/
-DeepLearningCourse/learning/NN/ImageNet-1K
+model_implementation_training/checkpoints
+model_implementation_training/dataset/
